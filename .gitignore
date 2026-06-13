@@ -1,0 +1,16 @@
+# Virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Secrets — NEVER commit these
+.env
+.streamlit/secrets.toml
+
+# Local database
+mediplan.db
+mediplan.db-wal
+mediplan.db-shm
+
+# OS files
+.DS_Store

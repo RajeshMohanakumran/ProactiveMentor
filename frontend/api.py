@@ -14,19 +14,31 @@ def _get(path: str, params: dict = None):
         r = requests.get(f"{BACKEND_URL}{path}", params=params, timeout=30)
         r.raise_for_status()
         return r.json()
+    except requests.exceptions.ConnectionError:
+        return {"_error": f"Cannot reach backend at {BACKEND_URL}. Is FastAPI running?"}
+    except requests.exceptions.Timeout:
+        return {"_error": "Backend timed out."}
     except Exception as e:
-        st.error(f"Backend error: {e}")
-        return None
+        return {"_error": str(e)}
 
 
 def _post(path: str, data: dict = None):
     try:
-        r = requests.post(f"{BACKEND_URL}{path}", json=data or {}, timeout=60)
+        r = requests.post(f"{BACKEND_URL}{path}", json=data or {}, timeout=90)
         r.raise_for_status()
         return r.json()
+    except requests.exceptions.ConnectionError:
+        return {"_error": f"Cannot reach backend at {BACKEND_URL}. Is FastAPI running?"}
+    except requests.exceptions.Timeout:
+        return {"_error": "Backend timed out — LLM call may be taking too long."}
+    except requests.exceptions.HTTPError as e:
+        try:
+            detail = e.response.json().get("detail", str(e))
+        except Exception:
+            detail = str(e)
+        return {"_error": f"Backend error: {detail}"}
     except Exception as e:
-        st.error(f"Backend error: {e}")
-        return None
+        return {"_error": str(e)}
 
 
 def _put(path: str, data: dict = None):
@@ -34,9 +46,10 @@ def _put(path: str, data: dict = None):
         r = requests.put(f"{BACKEND_URL}{path}", json=data or {}, timeout=30)
         r.raise_for_status()
         return r.json()
+    except requests.exceptions.ConnectionError:
+        return {"_error": f"Cannot reach backend at {BACKEND_URL}. Is FastAPI running?"}
     except Exception as e:
-        st.error(f"Backend error: {e}")
-        return None
+        return {"_error": str(e)}
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -46,7 +59,10 @@ def save_profile(profile: dict):
 
 
 def get_profile():
-    return _get("/profile")
+    result = _get("/profile")
+    if result is None or "_error" in result:
+        return None
+    return result
 
 
 def update_schedule(schedule: dict):
@@ -59,7 +75,10 @@ def generate_plan():
 
 def get_plan(date_str: str = None):
     params = {"date_str": date_str} if date_str else {}
-    return _get("/plan", params) or []
+    result = _get("/plan", params)
+    if result is None or (isinstance(result, dict) and "_error" in result):
+        return []
+    return result
 
 
 def replan():
@@ -71,16 +90,30 @@ def mark_task(task_id: int, status: str):
 
 
 def get_progress():
-    return _get("/progress") or {}
+    result = _get("/progress")
+    if result is None or "_error" in result:
+        return {}
+    return result
 
 
 def send_chat(message: str):
+    """Returns (response_text, error_str_or_None)."""
     result = _post("/chat", {"message": message})
-    return result.get("response", "") if result else ""
+    if result is None:
+        return "", "No response from backend."
+    if "_error" in result:
+        return "", result["_error"]
+    return result.get("response", ""), None
 
 
 def get_chat_history(limit: int = 40):
-    return _get("/chat/history", {"limit": limit}) or []
+    """Returns (history_list, error_str_or_None)."""
+    result = _get("/chat/history", {"limit": limit})
+    if result is None:
+        return [], "No response from backend."
+    if isinstance(result, dict) and "_error" in result:
+        return [], result["_error"]
+    return result, None
 
 
 def trigger_proactive(trigger_type: str = "study_time"):
@@ -88,7 +121,10 @@ def trigger_proactive(trigger_type: str = "study_time"):
 
 
 def get_last_proactive():
-    return _get("/proactive/last") or {}
+    result = _get("/proactive/last")
+    if result is None or "_error" in result:
+        return {}
+    return result
 
 
 def health_check() -> bool:

@@ -5,11 +5,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from frontend.api import (get_profile, get_plan, get_chat_history,
                            send_chat, trigger_proactive, get_last_proactive,
                            health_check, BACKEND_URL)
+from frontend.session import get_user_id
 from shared.db import init_db
 from datetime import date, datetime
 
 init_db()
-profile = get_profile()
+user_id = get_user_id()
+profile = get_profile(user_id)
 if not profile:
     st.warning("Set up your profile first.")
     if st.button("Setup →"): st.switch_page("pages/1_Setup.py")
@@ -63,27 +65,27 @@ with st.expander("🔧 Test proactive triggers", expanded=False):
     with c1:
         if st.button("▶ Study time", use_container_width=True, disabled=not backend_ok):
             with st.spinner("Generating..."):
-                res = trigger_proactive("study_time")
+                res = trigger_proactive(user_id, "study_time")
             if res and "_error" in res:
                 st.session_state["chat_error"] = res["_error"]
             st.rerun()
     with c2:
         if st.button("⚠ Behind schedule", use_container_width=True, disabled=not backend_ok):
             with st.spinner("Generating..."):
-                res = trigger_proactive("behind_schedule")
+                res = trigger_proactive(user_id, "behind_schedule")
             if res and "_error" in res:
                 st.session_state["chat_error"] = res["_error"]
             st.rerun()
     with c3:
         if st.button("📅 Exam near", use_container_width=True, disabled=not backend_ok):
             with st.spinner("Generating..."):
-                res = trigger_proactive("exam_near")
+                res = trigger_proactive(user_id, "exam_near")
             if res and "_error" in res:
                 st.session_state["chat_error"] = res["_error"]
             st.rerun()
 
 # ── Today's context ────────────────────────────────────────────────────────────
-today_tasks = get_plan(date.today().isoformat())
+today_tasks = get_plan(user_id, date.today().isoformat())
 pending = [t for t in today_tasks if t["status"]=="pending"]
 if pending:
     topics_str = " · ".join(f"{t['subject']}: {t['topic']}" for t in pending[:4])
@@ -93,7 +95,7 @@ if pending:
     unsafe_allow_html=True)
 
 # ── Last proactive ─────────────────────────────────────────────────────────────
-last = get_last_proactive()
+last = get_last_proactive(user_id)
 if last and last.get("created_at"):
     try:
         mins = int((datetime.now() - datetime.fromisoformat(last["created_at"])).total_seconds()//60)
@@ -108,7 +110,7 @@ if last and last.get("created_at"):
         pass
 
 # ── Chat history ───────────────────────────────────────────────────────────────
-history, hist_error = get_chat_history(40)
+history, hist_error = get_chat_history(user_id, 40)
 if hist_error and backend_ok:
     st.warning(f"Couldn't load chat history: {hist_error}")
 
@@ -163,7 +165,7 @@ if user_input and not st.session_state.get("chat_pending_input"):
 # Step 2: on the rerun where pending_input is set, actually call the backend
 if st.session_state.get("chat_pending_input"):
     msg_to_send = st.session_state.pop("chat_pending_input")
-    response, error = send_chat(msg_to_send)
+    response, error = send_chat(user_id, msg_to_send)
     st.session_state["chat_pending_msg"] = None
     st.session_state["chat_error"] = error
     st.rerun()
@@ -184,7 +186,7 @@ if not history:
         with cols[i%3]:
             if st.button(s, key=f"qs_{i}", use_container_width=True, disabled=not backend_ok):
                 with st.spinner("Thinking..."):
-                    response, error = send_chat(s)
+                    response, error = send_chat(user_id, s)
                 st.session_state["chat_error"] = error
                 st.rerun()
 

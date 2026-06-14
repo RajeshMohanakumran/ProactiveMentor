@@ -111,7 +111,7 @@ def planner_node(state: PlannerState) -> PlannerState:
     try:
         raw  = llm_call(system, user, temperature=0.2, max_tokens=8192)
         plan = robust_parse_json(raw)
-        save_plan(plan)
+        save_plan(state["profile"]["user_id"], plan)
         return {**state, "plan": plan}
     except Exception as e:
         return {**state, "error": str(e)}
@@ -122,7 +122,7 @@ def emergency_planner_node(state: PlannerState) -> PlannerState:
     Emergency phase — only plan revision of topics already in the database.
     Does NOT call LLM for new topics; generates a lightweight revision plan.
     """
-    existing = [t for t in get_plan() if t["status"] in ("done", "pending")]
+    existing = [t for t in get_plan(state["profile"]["user_id"]) if t["status"] in ("done", "pending")]
     # Pick top high-priority topics the student has already seen
     high     = [t for t in existing if t.get("priority") == "high"][:6]
     medium   = [t for t in existing if t.get("priority") == "medium"][:4]
@@ -144,7 +144,7 @@ def emergency_planner_node(state: PlannerState) -> PlannerState:
     if not plan:
         return planner_node(state)
 
-    save_plan(plan)
+    save_plan(state["profile"]["user_id"], plan)
     return {**state, "plan": plan}
 
 
@@ -194,7 +194,7 @@ class ProactiveState(TypedDict):
 
 def progress_node(state: ProactiveState) -> ProactiveState:
     try:
-        stats = get_stats()
+        stats = get_stats(state["profile"]["user_id"])
         phase = detect_phase(state["profile"]["exam_date"])
         total = stats.get("total", 1)
         done  = stats.get("done", 0)
@@ -231,7 +231,7 @@ def drift_router(state: ProactiveState) -> Literal["proactive_node", "replan_nod
 def proactive_node(state: ProactiveState) -> ProactiveState:
     profile  = state["profile"]
     today    = date.today().isoformat()
-    today_tasks = get_plan(today)
+    today_tasks = get_plan(profile["user_id"], today)
     pending  = [t for t in today_tasks if t["status"] == "pending"]
     done_t   = [t for t in today_tasks if t["status"] == "done"]
 
@@ -251,11 +251,11 @@ def proactive_node(state: ProactiveState) -> ProactiveState:
     )
     try:
         msg = llm_call(PROACTIVE_SYSTEM, user, temperature=0.8, fast=True, max_tokens=300)
-        log_proactive(state["trigger_type"], state["phase"], msg)
+        log_proactive(profile["user_id"], state["trigger_type"], state["phase"], msg)
         return {**state, "proactive_msg": msg}
     except Exception as e:
         err = str(e)
-        log_proactive(state["trigger_type"], state["phase"], f"[error: {err}]")
+        log_proactive(profile["user_id"], state["trigger_type"], state["phase"], f"[error: {err}]")
         return {**state, "proactive_msg": "", "error": err}
 
 
@@ -269,7 +269,7 @@ def replan_node(state: ProactiveState) -> ProactiveState:
     dr       = days_left(profile["exam_date"])
     phase    = state["phase"]
 
-    pending  = [t for t in get_plan() if t["status"] == "pending"][:20]
+    pending  = [t for t in get_plan(profile["user_id"]) if t["status"] == "pending"][:20]
     pending_str = "\n".join(f"- {t['subject']}: {t['topic']}" for t in pending)
 
     user = REPLAN_USER.format(
@@ -285,7 +285,7 @@ def replan_node(state: ProactiveState) -> ProactiveState:
     try:
         raw  = llm_call(REPLAN_SYSTEM, user, temperature=0.2, max_tokens=8192)
         plan = robust_parse_json(raw)
-        save_plan(plan)
+        save_plan(profile["user_id"], plan)
         # Also send a proactive message about the replan
         updated_state = {**state, "new_plan": plan, "should_replan": True}
         return proactive_node(updated_state)
@@ -340,7 +340,7 @@ def context_node(state: TutorState) -> TutorState:
     try:
         subjects = state["profile"].get("subjects", [])
         ctx      = get_syllabus_context(subjects)[:3000]
-        today_tasks = get_plan(date.today().isoformat())
+        today_tasks = get_plan(state["profile"]["user_id"], date.today().isoformat())
         plan_topics  = " ".join(t["topic"].lower() for t in today_tasks)
         msg_lower    = state["user_message"].lower()
         is_on_plan   = any(
@@ -359,7 +359,7 @@ def tutor_node(state: TutorState) -> TutorState:
     dr      = days_left(profile["exam_date"])
     phase   = detect_phase(profile["exam_date"])
 
-    today_tasks   = get_plan(date.today().isoformat())
+    today_tasks   = get_plan(profile["user_id"], date.today().isoformat())
     todays_topics = ", ".join(
         f"{t['subject']}: {t['topic']}" for t in today_tasks[:5]
     ) or "open revision"
@@ -438,8 +438,8 @@ def run_planner(profile: dict) -> dict:
     return get_planner().invoke(state)
 
 
-def run_proactive(trigger_type: str) -> str:
-    profile = get_profile()
+def run_proactive(user_id: str, trigger_type: str) -> str:
+    profile = get_profile(user_id)
     if not profile:
         return ""
     state: ProactiveState = {
@@ -452,8 +452,8 @@ def run_proactive(trigger_type: str) -> str:
     return result.get("proactive_msg", "")
 
 
-def run_replan() -> dict:
-    profile = get_profile()
+def run_replan(user_id: str) -> dict:
+    profile = get_profile(user_id)
     if not profile:
         return {"error": "No profile"}
     state: ProactiveState = {
@@ -465,8 +465,8 @@ def run_replan() -> dict:
     return get_proactive().invoke(state)
 
 
-def run_tutor(user_message: str, history: list) -> str:
-    profile = get_profile()
+def run_tutor(user_id: str, user_message: str, history: list) -> str:
+    profile = get_profile(user_id)
     if not profile:
         return "Please complete your profile setup first!"
     state: TutorState = {

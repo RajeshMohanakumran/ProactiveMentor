@@ -3,17 +3,20 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from frontend.api import get_profile, get_progress
+from frontend.session import get_user_id
+
+user_id = get_user_id()
 import plotly.graph_objects as go
 from datetime import date, datetime
 
-profile = get_profile()
+profile = get_profile(user_id)
 if not profile:
     st.warning("Set up your profile first.")
     st.stop()
 
 st.markdown("## 📊 Progress")
 
-prog = get_progress()
+prog = get_progress(user_id)
 total = prog.get("total",0); done = prog.get("done",0)
 pct   = round(done/total*100,1) if total else 0
 dr    = prog.get("days_remaining",0)

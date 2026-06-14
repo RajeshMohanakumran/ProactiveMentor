@@ -4,9 +4,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from frontend.api import get_profile, get_plan, mark_task, replan
+from frontend.session import get_user_id
+
+user_id = get_user_id()
 from datetime import date, timedelta
 
-profile = get_profile()
+profile = get_profile(user_id)
 if not profile:
     st.warning("Set up your profile first.")
     if st.button("Go to setup"): st.switch_page("pages/1_Setup.py")
@@ -15,22 +18,23 @@ if not profile:
 st.markdown("## 📋 Study Plan")
 
 view = st.radio("View", ["Today","This week","All"], horizontal=True)
-col_r, = st.columns([1])
 if st.button("🔄 Fell behind? Replan"):
     with st.spinner("Replanning..."):
-        res = replan()
-    if res:
+        res = replan(user_id)
+    if res and "_error" not in res:
         st.success(f"Plan updated! {res.get('proactive_msg','')}")
         st.rerun()
+    elif res:
+        st.error(f"⚠ {res['_error']}")
 
 today = date.today()
 if view == "Today":
-    tasks = get_plan(today.isoformat())
+    tasks = get_plan(user_id, today.isoformat())
 elif view == "This week":
-    all_t = get_plan()
+    all_t = get_plan(user_id)
     tasks = [t for t in all_t if today.isoformat() <= t["plan_date"] <= (today+timedelta(7)).isoformat()]
 else:
-    tasks = get_plan()
+    tasks = get_plan(user_id)
 
 if not tasks:
     st.info("No tasks yet. Generate your plan from Setup.")
@@ -61,9 +65,9 @@ for day_str, day_tasks in grouped.items():
             with cb:
                 if not is_done:
                     if st.button("✅", key=f"d_{t['id']}"):
-                        mark_task(t["id"],"done"); st.rerun()
+                        mark_task(user_id, t["id"],"done"); st.rerun()
                 else:
                     st.markdown("<span style='color:#22C55E'>✓</span>",unsafe_allow_html=True)
             with cc:
                 if st.button("⏭", key=f"s_{t['id']}"):
-                    mark_task(t["id"],"skipped"); st.rerun()
+                    mark_task(user_id, t["id"],"skipped"); st.rerun()

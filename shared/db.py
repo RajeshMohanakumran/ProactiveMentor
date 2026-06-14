@@ -1,17 +1,11 @@
 """
-Shared database layer — used by both FastAPI backend and Streamlit frontend.
+Shared database layer — multi-tenant via user_id.
 
 Design: ONE persistent SQLite connection for the whole process, guarded by a
-single threading.Lock. All reads and writes go through this lock.
-
-Why: this app has a single user, and concurrent access only comes from
-(1) FastAPI request handlers and (2) the APScheduler background thread.
-Per-call connections + WAL mode still hit "database is locked" on Windows
-under this pattern (multiple short-lived connections from different threads).
-A single connection + lock removes the race entirely — every DB op is
-serialized, which is irrelevant for performance at this scale (single user,
-SQLite ops take microseconds; only LLM calls are slow, and those don't hold
-the lock).
+single threading.Lock (see earlier fix for Windows "database is locked").
+Every table now has a user_id column, and every query is scoped to it —
+so concurrent users on the deployed app never see or overwrite each other's
+profile, plan, or chat history.
 """
 import sqlite3, json, threading
 from pathlib import Path
@@ -39,7 +33,7 @@ def init_db():
         conn = _get_conn()
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS user_profile (
-            id            INTEGER PRIMARY KEY,
+            user_id       TEXT PRIMARY KEY,
             name          TEXT NOT NULL,
             exam_name     TEXT NOT NULL,
             exam_date     TEXT NOT NULL,
@@ -54,6 +48,7 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS study_plan (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id       TEXT NOT NULL,
             plan_date     TEXT NOT NULL,
             subject       TEXT NOT NULL,
             topic         TEXT NOT NULL,
@@ -65,28 +60,35 @@ def init_db():
             phase         TEXT DEFAULT 'sprint',  -- marathon/sprint/crunch/emergency
             created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE INDEX IF NOT EXISTS idx_plan_user ON study_plan(user_id);
 
         CREATE TABLE IF NOT EXISTS conversations (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id       TEXT NOT NULL,
             role          TEXT NOT NULL,          -- user / assistant
             content       TEXT NOT NULL,
             agent_type    TEXT DEFAULT 'tutor',
             created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE INDEX IF NOT EXISTS idx_conv_user ON conversations(user_id);
 
         CREATE TABLE IF NOT EXISTS proactive_log (
             id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id       TEXT NOT NULL,
             trigger_type  TEXT NOT NULL,
             phase         TEXT,
             message       TEXT NOT NULL,
             delivered     INTEGER DEFAULT 0,
             created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE INDEX IF NOT EXISTS idx_proactive_user ON proactive_log(user_id);
 
         CREATE TABLE IF NOT EXISTS scheduler_state (
-            key           TEXT PRIMARY KEY,
+            user_id       TEXT NOT NULL,
+            key           TEXT NOT NULL,
             value         TEXT,
-            updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, key)
         );
         """)
         conn.commit()
@@ -94,16 +96,17 @@ def init_db():
 
 # ── Profile ───────────────────────────────────────────────────────────────────
 
-def save_profile(p: dict):
+def save_profile(user_id: str, p: dict):
     with _lock:
         conn = _get_conn()
-        conn.execute("DELETE FROM user_profile")
+        conn.execute("DELETE FROM user_profile WHERE user_id=?", (user_id,))
         conn.execute("""
             INSERT INTO user_profile
-                (name, exam_name, exam_date, subjects, weak_areas,
+                (user_id, name, exam_name, exam_date, subjects, weak_areas,
                  hours_per_day, schedule, telegram_chat_id)
-            VALUES (?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?)
         """, (
+            user_id,
             p["name"], p["exam_name"], p["exam_date"],
             json.dumps(p.get("subjects", [])),
             json.dumps(p.get("weak_areas", [])),
@@ -114,10 +117,12 @@ def save_profile(p: dict):
         conn.commit()
 
 
-def get_profile() -> dict | None:
+def get_profile(user_id: str) -> dict | None:
     with _lock:
         conn = _get_conn()
-        row = conn.execute("SELECT * FROM user_profile LIMIT 1").fetchone()
+        row = conn.execute(
+            "SELECT * FROM user_profile WHERE user_id=?", (user_id,)
+        ).fetchone()
     if not row:
         return None
     p = dict(row)
@@ -129,28 +134,37 @@ def get_profile() -> dict | None:
     return p
 
 
-def update_schedule(schedule: dict):
+def update_schedule(user_id: str, schedule: dict):
     with _lock:
         conn = _get_conn()
         conn.execute(
-            "UPDATE user_profile SET schedule=?, updated_at=CURRENT_TIMESTAMP",
-            (json.dumps(schedule),)
+            "UPDATE user_profile SET schedule=?, updated_at=CURRENT_TIMESTAMP WHERE user_id=?",
+            (json.dumps(schedule), user_id)
         )
         conn.commit()
 
 
-# ── Study plan ────────────────────────────────────────────────────────────────
-
-def save_plan(tasks: list):
+def get_all_user_ids() -> list[str]:
+    """Used by the scheduler to iterate over every user."""
     with _lock:
         conn = _get_conn()
-        conn.execute("DELETE FROM study_plan")
+        rows = conn.execute("SELECT user_id FROM user_profile").fetchall()
+    return [r["user_id"] for r in rows]
+
+
+# ── Study plan ────────────────────────────────────────────────────────────────
+
+def save_plan(user_id: str, tasks: list):
+    with _lock:
+        conn = _get_conn()
+        conn.execute("DELETE FROM study_plan WHERE user_id=?", (user_id,))
         conn.executemany("""
             INSERT INTO study_plan
-                (plan_date, subject, topic, subtopics,
+                (user_id, plan_date, subject, topic, subtopics,
                  duration_mins, priority, session_type, phase)
-            VALUES (?,?,?,?,?,?,?,?)
+            VALUES (?,?,?,?,?,?,?,?,?)
         """, [(
+            user_id,
             t["date"], t["subject"], t["topic"],
             json.dumps(t.get("subtopics", [])),
             t.get("duration_mins", 60),
@@ -161,17 +175,18 @@ def save_plan(tasks: list):
         conn.commit()
 
 
-def get_plan(date_str: str | None = None) -> list:
+def get_plan(user_id: str, date_str: str | None = None) -> list:
     with _lock:
         conn = _get_conn()
         if date_str:
             rows = conn.execute(
-                "SELECT * FROM study_plan WHERE plan_date=? ORDER BY id",
-                (date_str,)
+                "SELECT * FROM study_plan WHERE user_id=? AND plan_date=? ORDER BY id",
+                (user_id, date_str)
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM study_plan ORDER BY plan_date, id"
+                "SELECT * FROM study_plan WHERE user_id=? ORDER BY plan_date, id",
+                (user_id,)
             ).fetchall()
     result = []
     for r in rows:
@@ -184,31 +199,40 @@ def get_plan(date_str: str | None = None) -> list:
     return result
 
 
-def mark_task(task_id: int, status: str):
+def mark_task(user_id: str, task_id: int, status: str):
     with _lock:
         conn = _get_conn()
-        conn.execute("UPDATE study_plan SET status=? WHERE id=?", (status, task_id))
+        conn.execute(
+            "UPDATE study_plan SET status=? WHERE id=? AND user_id=?",
+            (status, task_id, user_id)
+        )
         conn.commit()
 
 
-def get_stats() -> dict:
+def get_stats(user_id: str) -> dict:
     with _lock:
         conn = _get_conn()
-        total = conn.execute("SELECT COUNT(*) FROM study_plan").fetchone()[0]
-        done  = conn.execute("SELECT COUNT(*) FROM study_plan WHERE status='done'").fetchone()[0]
+        total = conn.execute(
+            "SELECT COUNT(*) FROM study_plan WHERE user_id=?", (user_id,)
+        ).fetchone()[0]
+        done = conn.execute(
+            "SELECT COUNT(*) FROM study_plan WHERE user_id=? AND status='done'", (user_id,)
+        ).fetchone()[0]
         today = date.today().isoformat()
         today_done = conn.execute(
-            "SELECT COUNT(*) FROM study_plan WHERE plan_date=? AND status='done'", (today,)
+            "SELECT COUNT(*) FROM study_plan WHERE user_id=? AND plan_date=? AND status='done'",
+            (user_id, today)
         ).fetchone()[0]
         today_total = conn.execute(
-            "SELECT COUNT(*) FROM study_plan WHERE plan_date=?", (today,)
+            "SELECT COUNT(*) FROM study_plan WHERE user_id=? AND plan_date=?",
+            (user_id, today)
         ).fetchone()[0]
         by_subj = conn.execute("""
             SELECT subject,
                    COUNT(*) as total,
                    SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) as done
-            FROM study_plan GROUP BY subject
-        """).fetchall()
+            FROM study_plan WHERE user_id=? GROUP BY subject
+        """, (user_id,)).fetchall()
     return {
         "total": total, "done": done,
         "today_done": today_done, "today_total": today_total,
@@ -218,71 +242,75 @@ def get_stats() -> dict:
 
 # ── Conversations ─────────────────────────────────────────────────────────────
 
-def add_message(role: str, content: str, agent_type: str = "tutor"):
+def add_message(user_id: str, role: str, content: str, agent_type: str = "tutor"):
     with _lock:
         conn = _get_conn()
         conn.execute(
-            "INSERT INTO conversations (role,content,agent_type) VALUES (?,?,?)",
-            (role, content, agent_type)
+            "INSERT INTO conversations (user_id,role,content,agent_type) VALUES (?,?,?,?)",
+            (user_id, role, content, agent_type)
         )
         conn.commit()
 
 
-def get_messages(agent_type: str = "tutor", limit: int = 40) -> list:
+def get_messages(user_id: str, agent_type: str = "tutor", limit: int = 40) -> list:
     with _lock:
         conn = _get_conn()
         rows = conn.execute(
-            "SELECT * FROM conversations WHERE agent_type=? ORDER BY created_at DESC LIMIT ?",
-            (agent_type, limit)
+            "SELECT * FROM conversations WHERE user_id=? AND agent_type=? ORDER BY created_at DESC LIMIT ?",
+            (user_id, agent_type, limit)
         ).fetchall()
     return [dict(r) for r in reversed(rows)]
 
 
 # ── Proactive log ─────────────────────────────────────────────────────────────
 
-def log_proactive(trigger: str, phase: str, message: str):
+def log_proactive(user_id: str, trigger: str, phase: str, message: str):
     with _lock:
         conn = _get_conn()
         conn.execute(
-            "INSERT INTO proactive_log (trigger_type,phase,message) VALUES (?,?,?)",
-            (trigger, phase, message)
+            "INSERT INTO proactive_log (user_id,trigger_type,phase,message) VALUES (?,?,?,?)",
+            (user_id, trigger, phase, message)
         )
         conn.commit()
 
 
-def get_last_proactive() -> dict | None:
+def get_last_proactive(user_id: str) -> dict | None:
     with _lock:
         conn = _get_conn()
         row = conn.execute(
-            "SELECT * FROM proactive_log ORDER BY created_at DESC LIMIT 1"
+            "SELECT * FROM proactive_log WHERE user_id=? ORDER BY created_at DESC LIMIT 1",
+            (user_id,)
         ).fetchone()
     return dict(row) if row else None
 
 
-def mark_proactive_delivered(pid: int):
+def mark_proactive_delivered(user_id: str, pid: int):
     with _lock:
         conn = _get_conn()
-        conn.execute("UPDATE proactive_log SET delivered=1 WHERE id=?", (pid,))
+        conn.execute(
+            "UPDATE proactive_log SET delivered=1 WHERE id=? AND user_id=?",
+            (pid, user_id)
+        )
         conn.commit()
 
 
 # ── Scheduler state ───────────────────────────────────────────────────────────
 
-def set_state(key: str, value: str):
+def set_state(user_id: str, key: str, value: str):
     with _lock:
         conn = _get_conn()
         conn.execute(
-            "INSERT OR REPLACE INTO scheduler_state (key,value,updated_at) VALUES (?,?,CURRENT_TIMESTAMP)",
-            (key, value)
+            "INSERT OR REPLACE INTO scheduler_state (user_id,key,value,updated_at) VALUES (?,?,?,CURRENT_TIMESTAMP)",
+            (user_id, key, value)
         )
         conn.commit()
 
 
-def get_state(key: str) -> str | None:
+def get_state(user_id: str, key: str) -> str | None:
     with _lock:
         conn = _get_conn()
         row = conn.execute(
-            "SELECT value FROM scheduler_state WHERE key=?", (key,)
+            "SELECT value FROM scheduler_state WHERE user_id=? AND key=?", (user_id, key)
         ).fetchone()
     return row["value"] if row else None
 

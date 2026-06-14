@@ -4,10 +4,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from frontend.api import get_profile, get_plan, get_progress, health_check
+from frontend.session import get_user_id
 from shared.db import init_db
 from datetime import date
-
-init_db()
 
 st.set_page_config(
     page_title="MediPlan AI",
@@ -15,6 +14,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+init_db()
+user_id = get_user_id()
 
 st.markdown("""
 <style>
@@ -48,7 +50,7 @@ with st.sidebar:
     else:
         st.warning("⚠ Backend offline — start with `uvicorn backend.main:app`")
 
-    profile = get_profile()
+    profile = get_profile(user_id)
     if profile:
         from datetime import datetime
         try:
@@ -69,7 +71,7 @@ with st.sidebar:
             <div style='margin-top:8px'><span class='phase-badge {badge}'>{label}</span></div>
         </div>""", unsafe_allow_html=True)
 
-        prog = get_progress()
+        prog = get_progress(user_id)
         total = prog.get("total",0); done = prog.get("done",0)
         pct = round(done/total*100) if total else 0
         st.markdown(f"""
@@ -83,7 +85,7 @@ with st.sidebar:
         st.info("👋 Set up your profile to get started")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-profile = get_profile()
+profile = get_profile(user_id)
 
 if not profile:
     st.markdown("## 👋 Welcome to MediPlan AI")
@@ -104,7 +106,7 @@ else:
     phase = detect_phase(profile["exam_date"])
 
     today_str = date.today().isoformat()
-    tasks = get_plan(today_str)
+    tasks = get_plan(user_id, today_str)
     pending = [t for t in tasks if t["status"]=="pending"]
     done_t  = [t for t in tasks if t["status"]=="done"]
 

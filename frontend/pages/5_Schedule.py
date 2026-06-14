@@ -1,15 +1,17 @@
 """
 Standalone schedule editor — student can update any day's study window
 without going through full setup again. Changes take effect in the
-backend scheduler within the next 5-minute check cycle.
+backend scheduler within the next 1-minute check cycle.
 """
 import streamlit as st, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from frontend.api import get_profile, update_schedule
+from frontend.session import get_user_id
 
-profile = get_profile()
+user_id = get_user_id()
+profile = get_profile(user_id)
 if not profile:
     st.warning("Set up your profile first.")
     st.stop()
@@ -78,11 +80,11 @@ with c2: override_end   = st.time_input("Today ends",   value=dtmod.time(20,0))
 col_save1, col_save2 = st.columns(2)
 with col_save1:
     if st.button("💾 Save weekly schedule", type="primary", use_container_width=True):
-        res = update_schedule(new_schedule)
-        if res:
+        res = update_schedule(user_id, new_schedule)
+        if res and "_error" not in res:
             st.success("Schedule saved — scheduler will pick this up in the next cycle.")
         else:
-            st.error("Could not save. Is the backend running?")
+            st.error(f"⚠ {res.get('_error','Unknown error') if res else 'Could not save.'}")
 
 with col_save2:
     if st.button("⚡ Apply today override", use_container_width=True):
@@ -91,8 +93,8 @@ with col_save2:
             "start": override_start.strftime("%H:%M"),
             "end":   override_end.strftime("%H:%M"),
         }]
-        res = update_schedule(today_schedule)
-        if res:
+        res = update_schedule(user_id, today_schedule)
+        if res and "_error" not in res:
             st.success(f"Today's window updated to {override_start.strftime('%H:%M')} – {override_end.strftime('%H:%M')}. Active in next scheduler cycle.")
         else:
-            st.error("Backend not reachable.")
+            st.error(f"⚠ {res.get('_error','Unknown error') if res else 'Backend not reachable.'}")

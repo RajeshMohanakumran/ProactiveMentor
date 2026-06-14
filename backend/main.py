@@ -1,11 +1,16 @@
 """
-MediPlan AI — FastAPI backend.
+MediPlan AI — FastAPI backend (multi-tenant).
 
 Responsibilities:
   - REST API for Streamlit frontend (plan, profile, chat, progress)
-  - APScheduler running in background — fires proactive agent at exact study times
-  - Dynamic schedule: reads user's per-day schedule from DB every check
-  - No hardcoded timings — everything driven by user's saved schedule
+  - APScheduler running in background — fires proactive agent at exact study
+    times, for EVERY registered user independently
+  - Dynamic schedule: reads each user's per-day schedule from DB every check
+  - No hardcoded timings — everything driven by each user's saved schedule
+
+Multi-tenancy: every endpoint takes a `user_id` query parameter. The frontend
+generates a random user_id per browser session (stored in the URL via
+?uid=...) so different visitors never see or overwrite each other's data.
 """
 import sys, os, traceback
 from pathlib import Path
@@ -18,14 +23,15 @@ from contextlib import asynccontextmanager
 from datetime import datetime, date
 import logging
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from shared.db import (
-    init_db, get_profile, save_profile, update_schedule,
+    init_db, get_profile, save_profile, update_schedule, get_all_user_ids,
     get_plan, get_stats, mark_task, add_message, get_messages,
     get_last_proactive, detect_phase, set_state, get_state,
 )
@@ -35,15 +41,23 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("mediplan")
 
 
-# ── Scheduler logic ───────────────────────────────────────────────────────────
+# ── Scheduler logic — runs for EVERY registered user ──────────────────────────
 
 def check_and_fire_proactive():
     """
-    Runs every 5 minutes via APScheduler.
-    Reads the user's dynamic schedule and fires proactive agent
-    at the exact minute their study window starts.
+    Runs every minute via APScheduler.
+    For each registered user, reads their dynamic schedule and fires the
+    proactive agent at the exact minute their study window starts.
     """
-    profile = get_profile()
+    for user_id in get_all_user_ids():
+        try:
+            _check_user_proactive(user_id)
+        except Exception as e:
+            log.error(f"Scheduler error for user {user_id}: {e}")
+
+
+def _check_user_proactive(user_id: str):
+    profile = get_profile(user_id)
     if not profile:
         return
 
@@ -54,7 +68,7 @@ def check_and_fire_proactive():
 
     if not today_slots:
         # No slots configured for today — check for behind-schedule trigger
-        _check_drift_trigger(profile)
+        _check_drift_trigger(user_id, profile)
         return
 
     for slot in today_slots:
@@ -62,30 +76,29 @@ def check_and_fire_proactive():
             slot_start = datetime.strptime(slot["start"], "%H:%M").replace(
                 year=now.year, month=now.month, day=now.day
             )
-            # Fire if we're within 5 minutes of the slot start
+            # Fire if we're within 1.5 minutes of the slot start
             diff_mins = (now - slot_start).total_seconds() / 60
             if 0 <= diff_mins <= 1.5:
                 # Avoid double-firing in the same slot
                 last_fired_key = f"last_fired_{today_key}_{slot['start']}"
-                last_fired_date = get_state(last_fired_key)
+                last_fired_date = get_state(user_id, last_fired_key)
                 if last_fired_date == date.today().isoformat():
-                    log.info(f"Already fired for {today_key} {slot['start']}, skipping")
                     continue
 
-                log.info(f"Firing proactive agent for slot {slot['start']}")
-                msg = run_proactive("study_time")
+                log.info(f"Firing proactive agent for user {user_id}, slot {slot['start']}")
+                msg = run_proactive(user_id, "study_time")
                 if msg:
-                    add_message("assistant", msg, "tutor")
-                    set_state(last_fired_key, date.today().isoformat())
-                    log.info("Proactive message added to chat")
+                    add_message(user_id, "assistant", msg, "tutor")
+                    set_state(user_id, last_fired_key, date.today().isoformat())
+                    log.info(f"Proactive message added for user {user_id}")
         except Exception as e:
-            log.error(f"Scheduler error for slot {slot}: {e}")
+            log.error(f"Scheduler error for user {user_id}, slot {slot}: {e}")
 
 
-def _check_drift_trigger(profile: dict):
+def _check_drift_trigger(user_id: str, profile: dict):
     """Secondary check — fire if student is significantly behind."""
     try:
-        stats = get_stats()
+        stats = get_stats(user_id)
         total = stats.get("total", 0)
         if total == 0:
             return
@@ -93,34 +106,41 @@ def _check_drift_trigger(profile: dict):
         dr    = (datetime.strptime(profile["exam_date"], "%Y-%m-%d").date() - date.today()).days
         if dr <= 0:
             return
-        # Expected completion proportion
         total_days = max(dr + (total // 3), 1)
         expected   = total * (1 - dr / total_days)
         drift      = max(0, (expected - done) / max(expected, 1))
         if drift > 0.35:
-            last = get_state("last_drift_check")
+            last = get_state(user_id, "last_drift_check")
             if last == date.today().isoformat():
                 return
-            log.info(f"Drift {drift:.2f} detected — firing behind_schedule trigger")
-            msg = run_proactive("behind_schedule")
+            log.info(f"Drift {drift:.2f} for user {user_id} — firing behind_schedule trigger")
+            msg = run_proactive(user_id, "behind_schedule")
             if msg:
-                add_message("assistant", msg, "tutor")
-                set_state("last_drift_check", date.today().isoformat())
+                add_message(user_id, "assistant", msg, "tutor")
+                set_state(user_id, "last_drift_check", date.today().isoformat())
     except Exception as e:
-        log.error(f"Drift check error: {e}")
+        log.error(f"Drift check error for user {user_id}: {e}")
 
 
-# Exam proximity trigger — daily at midnight
+# Exam proximity trigger — daily, checked every morning
 def check_exam_proximity():
-    profile = get_profile()
-    if not profile:
-        return
-    dr = (datetime.strptime(profile["exam_date"], "%Y-%m-%d").date() - date.today()).days
-    if dr in (30, 14, 7, 3, 1):
-        log.info(f"Exam proximity trigger: {dr} days remaining")
-        msg = run_proactive("exam_near")
-        if msg:
-            add_message("assistant", msg, "tutor")
+    for user_id in get_all_user_ids():
+        try:
+            profile = get_profile(user_id)
+            if not profile:
+                continue
+            dr = (datetime.strptime(profile["exam_date"], "%Y-%m-%d").date() - date.today()).days
+            if dr in (30, 14, 7, 3, 1):
+                last = get_state(user_id, f"exam_proximity_{dr}")
+                if last == date.today().isoformat():
+                    continue
+                log.info(f"Exam proximity trigger for user {user_id}: {dr} days remaining")
+                msg = run_proactive(user_id, "exam_near")
+                if msg:
+                    add_message(user_id, "assistant", msg, "tutor")
+                    set_state(user_id, f"exam_proximity_{dr}", date.today().isoformat())
+        except Exception as e:
+            log.error(f"Exam proximity error for user {user_id}: {e}")
 
 
 scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
@@ -145,13 +165,13 @@ scheduler.add_job(
 async def lifespan(app: FastAPI):
     init_db()
     scheduler.start()
-    log.info("MediPlan AI backend started — scheduler running")
+    log.info("MediPlan AI backend started — scheduler running (multi-tenant)")
     yield
     scheduler.shutdown()
     log.info("Scheduler stopped")
 
 
-app = FastAPI(title="MediPlan AI", version="2.0", lifespan=lifespan)
+app = FastAPI(title="MediPlan AI", version="2.1", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -162,13 +182,8 @@ app.add_middleware(
 
 
 # ── Global exception handler ──────────────────────────────────────────────────
-# Without this, any unhandled exception (e.g. inside get_profile() before a
-# route's own try/except) returns a plain-text 500 — which the frontend can't
-# parse as JSON, so it shows a generic "500 Server Error" with no real detail.
-# This guarantees every error reaches the frontend as readable JSON.
-
-from fastapi.responses import JSONResponse
-from fastapi import Request
+# Guarantees every error reaches the frontend as readable JSON, even if it
+# happens outside a route's own try/except.
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -210,6 +225,9 @@ class ProactiveIn(BaseModel):
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+# Every route takes `user_id: str` as a required query parameter, e.g.
+#   GET /profile?user_id=abc123
+#   POST /chat?user_id=abc123   (body: {"message": "..."})
 
 @app.get("/health")
 def health():
@@ -218,14 +236,14 @@ def health():
 
 # Profile
 @app.post("/profile")
-def create_profile(data: ProfileIn):
-    save_profile(data.model_dump())
+def create_profile(user_id: str, data: ProfileIn):
+    save_profile(user_id, data.model_dump())
     return {"ok": True}
 
 
 @app.get("/profile")
-def read_profile():
-    p = get_profile()
+def read_profile(user_id: str):
+    p = get_profile(user_id)
     if not p:
         raise HTTPException(404, "No profile found")
     return p
@@ -233,15 +251,15 @@ def read_profile():
 
 # Schedule (separate endpoint — user can update daily schedule without redoing full setup)
 @app.put("/schedule")
-def update_schedule_endpoint(data: ScheduleIn):
-    update_schedule(data.schedule)
+def update_schedule_endpoint(user_id: str, data: ScheduleIn):
+    update_schedule(user_id, data.schedule)
     return {"ok": True}
 
 
 # Plan
 @app.post("/plan/generate")
-def generate_plan():
-    profile = get_profile()
+def generate_plan(user_id: str):
+    profile = get_profile(user_id)
     if not profile:
         raise HTTPException(400, "No profile. Create profile first.")
     try:
@@ -257,29 +275,29 @@ def generate_plan():
 
 
 @app.get("/plan")
-def get_full_plan(date_str: str | None = None):
-    return get_plan(date_str)
+def get_full_plan(user_id: str, date_str: str | None = None):
+    return get_plan(user_id, date_str)
 
 
 @app.post("/plan/replan")
-def replan():
-    result = run_replan()
+def replan(user_id: str):
+    result = run_replan(user_id)
     if result.get("error"):
         raise HTTPException(500, result["error"])
     return {"ok": True, "proactive_msg": result.get("proactive_msg", "")}
 
 
 @app.post("/task")
-def update_task(data: TaskAction):
-    mark_task(data.task_id, data.status)
+def update_task(user_id: str, data: TaskAction):
+    mark_task(user_id, data.task_id, data.status)
     return {"ok": True}
 
 
 # Progress
 @app.get("/progress")
-def progress():
-    profile = get_profile()
-    stats   = get_stats()
+def progress(user_id: str):
+    profile = get_profile(user_id)
+    stats   = get_stats(user_id)
     phase   = detect_phase(profile["exam_date"]) if profile else "sprint"
     dr      = 0
     if profile:
@@ -292,12 +310,12 @@ def progress():
 
 # Chat
 @app.post("/chat")
-def chat(data: ChatIn):
+def chat(user_id: str, data: ChatIn):
     try:
-        history  = get_messages("tutor", limit=20)
-        add_message("user", data.message, "tutor")
-        response = run_tutor(data.message, history)
-        add_message("assistant", response, "tutor")
+        history  = get_messages(user_id, "tutor", limit=20)
+        add_message(user_id, "user", data.message, "tutor")
+        response = run_tutor(user_id, data.message, history)
+        add_message(user_id, "assistant", response, "tutor")
         return {"response": response}
     except Exception as e:
         log.error("‼ /chat crashed:\n" + traceback.format_exc())
@@ -305,17 +323,17 @@ def chat(data: ChatIn):
 
 
 @app.get("/chat/history")
-def chat_history(limit: int = 40):
-    return get_messages("tutor", limit)
+def chat_history(user_id: str, limit: int = 40):
+    return get_messages(user_id, "tutor", limit)
 
 
 # Proactive (manual trigger for testing / Streamlit fallback)
 @app.post("/proactive/trigger")
-def trigger_proactive(data: ProactiveIn):
+def trigger_proactive(user_id: str, data: ProactiveIn):
     try:
-        msg = run_proactive(data.trigger_type)
+        msg = run_proactive(user_id, data.trigger_type)
         if msg:
-            add_message("assistant", msg, "tutor")
+            add_message(user_id, "assistant", msg, "tutor")
         return {"message": msg}
     except Exception as e:
         log.error("‼ /proactive/trigger crashed:\n" + traceback.format_exc())
@@ -323,8 +341,8 @@ def trigger_proactive(data: ProactiveIn):
 
 
 @app.get("/proactive/last")
-def last_proactive():
-    return get_last_proactive() or {}
+def last_proactive(user_id: str):
+    return get_last_proactive(user_id) or {}
 
 
 # Scheduler status (for debugging)
@@ -336,4 +354,8 @@ def scheduler_status():
             "id":       job.id,
             "next_run": str(job.next_run_time),
         })
-    return {"running": scheduler.running, "jobs": jobs}
+    return {
+        "running": scheduler.running,
+        "jobs": jobs,
+        "registered_users": len(get_all_user_ids()),
+    }

@@ -4,11 +4,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from frontend.api import save_profile, generate_plan
+from frontend.session import get_user_id
 from shared.db import init_db
 from shared.syllabus import ALL_SUBJECTS
 from datetime import date, timedelta
 
 init_db()
+user_id = get_user_id()
 
 st.markdown("## 🎯 Set up your study plan")
 st.caption("No modes to choose — the system adapts automatically based on your exam date.")
@@ -81,14 +83,19 @@ if submitted:
             "schedule": schedule,
         }
         with st.spinner("Saving profile..."):
-            save_profile(profile)
-        with st.spinner(f"Generating your plan (phase: {phase_preview})..."):
-            result = generate_plan()
+            save_result = save_profile(user_id, profile)
+        if save_result and "_error" in save_result:
+            st.error(f"⚠ Could not save profile: {save_result['_error']}")
+            st.stop()
 
-        if result and not result.get("error"):
+        with st.spinner(f"Generating your plan (phase: {phase_preview})..."):
+            result = generate_plan(user_id)
+
+        if result and "_error" not in result:
             st.success(f"✅ Plan generated — {result.get('tasks',0)} sessions · Phase: {result.get('phase','')}")
             st.balloons()
             if st.button("Go to my plan →", type="primary"):
                 st.switch_page("pages/2_Study_Plan.py")
         else:
-            st.error(result.get("error","Backend error — is FastAPI running?") if result else "Could not connect to backend")
+            err_msg = result.get("_error", "Unknown error") if result else "Could not connect to backend"
+            st.error(f"⚠ {err_msg}")
